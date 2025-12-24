@@ -1,5 +1,5 @@
 # SVG Loader
-[![NPM](https://img.shields.io/npm/v/external-svg-loader.svg)](https://www.npmjs.com/package/external-svg-loader)
+[![NPM](https://img.shields.io/npm/v/@page-speed/svg-loader.svg)](https://www.npmjs.com/package/@page-speed/svg-loader)
 ![minified size](http://img.badgesize.io/shubhamjain/svg-loader/master/svg-loader.min.js?label=minified%20size&v=10) ![gzip size](http://img.badgesize.io/shubhamjain/svg-loader/master/svg-loader.min.js?compression=gzip&v=10)
 
 SVGs from an external source can be rendered with `<img>` tags, but this has multiple drawbacks: you can't customize the fill or stroke colors, use CSS variables, or use focus/hover states.
@@ -54,16 +54,16 @@ as long as you're using the correct attributes.
 
 
 ```
-npm install external-svg-loader
+npm install @page-speed/svg-loader
 ```
 
-Then, in your app, require/import `external-svg-loader` anywhere. Here's an example:
+Then, in your app, require/import `@page-speed/svg-loader` anywhere. Here's an example:
 
 ```jsx
 import React from "react";
 import ReactDOM from "react-dom";
 
-import "external-svg-loader";
+import "@page-speed/svg-loader";
 
 class App extends React.Component {
   render() {
@@ -92,7 +92,7 @@ SVG loader can also be included via unpkg CDN. Example:
 ```html
 <script
     type="text/javascript"
-    src="https://unpkg.com/external-svg-loader@latest/svg-loader.min.js"
+    src="https://unpkg.com/@page-speed/svg-loader@latest/svg-loader.min.js"
     async></script>
 ```
 
@@ -178,7 +178,7 @@ You can disable this behavior by:
 ```
 
 ## Lazy Loading
-You can also lazy load icons by using `data-loading=lazy`. This will make icon not load until it's about to enter the viewport. For lazy loading, `external-svg-loader` uses [Intersection Observer API](https://developer.mozilla.org/en-US/docs/Web/API/Intersection_Observer_API).
+You can also lazy load icons by using `data-loading=lazy`. This will make icon not load until it's about to enter the viewport. For lazy loading, `@page-speed/svg-loader` uses [Intersection Observer API](https://developer.mozilla.org/en-US/docs/Web/API/Intersection_Observer_API).
 
 ```html
 <svg

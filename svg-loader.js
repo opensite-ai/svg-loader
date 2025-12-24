@@ -5,173 +5,248 @@ const cssScope = require("./lib/scope-css");
 const cssUrlFixer = require("./lib/css-url-fixer");
 const counter = require("./lib/counter");
 
-const isCacheAvailable = async (url) => {
+const CACHE_PREFIX = "loader_";
+const DEFAULT_CACHE_TTL_MS = 60 * 60 * 1000 * 24 * 30;
+const SVG_SELECTOR = "svg[data-src]";
+const UNRENDERED_SELECTOR = "svg[data-src]:not([data-id])";
+
+const memoryCache = new Map();
+const inflightRequests = new Map();
+const attributesSet = new WeakMap();
+const observedElements = new WeakSet();
+const eventNameCache = new Set();
+
+const safeParseJson = (value) => {
+    if (!value) {
+        return null;
+    }
+
+    if (typeof value === "object") {
+        return value;
+    }
+
+    try {
+        return JSON.parse(value);
+    } catch (e) {
+        return null;
+    }
+};
+
+const getCacheKey = (url) => `${CACHE_PREFIX}${url}`;
+
+const removeCacheEntry = async (cacheKey) => {
+    try {
+        await del(cacheKey);
+    } catch (e) {}
+
+    try {
+        localStorage.removeItem(cacheKey);
+    } catch (e) {}
+};
+
+const getCacheEntry = async (url) => {
+    const cacheKey = getCacheKey(url);
     let item;
 
     try {
-        item = await get(`loader_${url}`);
+        item = await get(cacheKey);
     } catch (e) {}
 
     if (!item) {
         try {
-            item = localStorage.getItem(`loader_${url}`);
-        } catch(e) {}
+            item = localStorage.getItem(cacheKey);
+        } catch (e) {}
     }
 
     if (!item) {
-        return;
+        return null;
     }
 
-    item = JSON.parse(item);
+    const parsed = safeParseJson(item);
 
-    if (Date.now() < item.expiry) {
-        return item.data;
-    } else {
-        del(`loader_${url}`);
-        return;
+    if (!parsed || typeof parsed !== "object") {
+        await removeCacheEntry(cacheKey);
+        return null;
     }
+
+    if (Date.now() < parsed.expiry) {
+        return parsed.data;
+    }
+
+    await removeCacheEntry(cacheKey);
+    return null;
 };
 
-const setCache = async (url, data, cacheOpt) => {
-    const cacheExp = parseInt(cacheOpt, 10);
-    const dataToSet =  JSON.stringify({
+const setCacheEntry = async (url, data, ttlMs) => {
+    const cacheKey = getCacheKey(url);
+    const payload = JSON.stringify({
         data,
-        expiry: Date.now() + (Number.isNaN(cacheExp) ? 60 * 60 * 1000 * 24 * 30 : cacheExp * 1000)
+        expiry: Date.now() + ttlMs
     });
 
     try {
-        await set(`loader_${url}`, dataToSet);
+        await set(cacheKey, payload);
+        return;
+    } catch (e) {}
+
+    try {
+        localStorage.setItem(cacheKey, payload);
     } catch (e) {
-        try {
-            localStorage.setItem(`loader_${url}`, dataToSet)
-        } catch (e) {
-            console.warn("Failed to set cache: ", e)
-        }
-    };
+        console.warn("Failed to set cache: ", e);
+    }
 };
 
-const DOM_EVENTS = [];
-const getAllEventNames = () => {
-    if (DOM_EVENTS.length) {
-        return DOM_EVENTS;
+const parseCacheTtl = (cacheOpt) => {
+    if (!cacheOpt || cacheOpt === "disabled") {
+        return DEFAULT_CACHE_TTL_MS;
     }
 
-    for (const prop in document.body) {
-        if (prop.startsWith("on")) {
-            DOM_EVENTS.push(prop);
+    const cacheSeconds = Number.parseInt(cacheOpt, 10);
+
+    if (!Number.isFinite(cacheSeconds) || cacheSeconds <= 0) {
+        return DEFAULT_CACHE_TTL_MS;
+    }
+
+    return cacheSeconds * 1000;
+};
+
+const getAllEventNames = () => {
+    if (eventNameCache.size) {
+        return eventNameCache;
+    }
+
+    if (typeof document !== "undefined" && document.body) {
+        for (const prop in document.body) {
+            if (prop.startsWith("on")) {
+                eventNameCache.add(prop);
+            }
         }
     }
 
     // SVG <animate> events
-    DOM_EVENTS.push('onbegin', 'onend', 'onrepeat');
+    eventNameCache.add("onbegin");
+    eventNameCache.add("onend");
+    eventNameCache.add("onrepeat");
 
     // Some non-standard events, just in case the browser is handling them
-    DOM_EVENTS.push('onfocusin', 'onfocusout', 'onbounce', 'onfinish', 'onshow');
+    eventNameCache.add("onfocusin");
+    eventNameCache.add("onfocusout");
+    eventNameCache.add("onbounce");
+    eventNameCache.add("onfinish");
+    eventNameCache.add("onshow");
 
-    return DOM_EVENTS;
+    return eventNameCache;
 };
 
-const attributesSet = {};
 const renderBody = (elem, options, body) => {
     const { enableJs, disableUniqueIds, disableCssScoping, spriteIconId } = options;
-
     const isSpriteIcon = !!spriteIconId;
     const parser = new DOMParser();
     const doc = parser.parseFromString(body, "text/html");
     const fragment = isSpriteIcon ? doc.getElementById(spriteIconId) : doc.querySelector("svg");
 
+    if (!fragment) {
+        throw Error("Resource returned invalid SVG markup.");
+    }
+
     const eventNames = getAllEventNames();
-
-    // When svg-loader is loading in the same element, it's
-    // important to keep track of original properties.
-    const elemAttributesSet = attributesSet[elem.getAttribute("data-id")] || new Set();
-
+    const elemAttributesSet = attributesSet.get(elem) || new Set();
     const elemUniqueId = elem.getAttribute("data-id") || `svg-loader_${counter.incr()}`;
-
     const idMap = {};
 
     if (!disableUniqueIds) {
         // Append a unique suffix for every ID so elements don't conflict.
-        Array.from(fragment.querySelectorAll("[id]")).forEach((elem) => {
-            const id = elem.getAttribute("id");
+        const idElements = fragment.querySelectorAll("[id]");
+        for (const element of idElements) {
+            const id = element.getAttribute("id");
             const newId = `${id}_${counter.incr()}`;
-            elem.setAttribute("id", newId);
-
+            element.setAttribute("id", newId);
             idMap[id] = newId;
-        });
+        }
     }
 
-    Array.from(fragment.querySelectorAll("*")).concat(fragment).forEach((el) => {
+    const processElement = (el) => {
+        const tagName = el.tagName ? el.tagName.toLowerCase() : "";
+
         // Unless explicitly set, remove JS code (default)
-        if (el.tagName === "script") {
+        if (tagName === "script") {
             el.remove();
             if (!enableJs) {
                 return;
-            } else {
-                const scriptEl = document.createElement("script");
-                scriptEl.appendChild(el.childNodes[0]);
-                elem.appendChild(scriptEl)
             }
+
+            const scriptEl = document.createElement("script");
+            if (el.childNodes[0]) {
+                scriptEl.appendChild(el.childNodes[0]);
+            }
+            elem.appendChild(scriptEl);
+            return;
         }
 
-        const attributesToRemove = []
-        for (let i = 0; i < el.attributes.length; i++) {
-            const {
-                name,
-                value
-            } = el.attributes[i];
+        const attributesToRemove = [];
 
+        for (let i = 0; i < el.attributes.length; i++) {
+            const { name, value } = el.attributes[i];
             const newValue = cssUrlFixer(idMap, value, name);
 
             if (value !== newValue) {
                 el.setAttribute(name, newValue);
             }
 
+            const lowerName = name.toLowerCase();
+
             // Remove event functions: onmouseover, onclick ... unless specifically enabled
-            if (eventNames.includes(name.toLowerCase()) && !enableJs) {
+            if (eventNames.has(lowerName) && !enableJs) {
                 attributesToRemove.push(name);
                 continue;
             }
 
             // Remove "javascript:..." unless specifically enabled
-            if (["href", "xlink:href", "values"].includes(name) && value.startsWith("javascript") && !enableJs) {
+            if (["href", "xlink:href", "values"].includes(lowerName) && value.startsWith("javascript") && !enableJs) {
                 attributesToRemove.push(name);
             }
         }
 
-        attributesToRemove.forEach((attr) => el.removeAttribute(attr))
+        for (const attr of attributesToRemove) {
+            el.removeAttribute(attr);
+        }
 
         // .first -> [data-id="svg_loader_341xx"] .first
         // Makes sure that class names don't conflict with each other.
-        if (el.tagName === "style" && !disableCssScoping) {
+        if (tagName === "style" && !disableCssScoping && el.innerHTML) {
             let newValue = cssScope(el.innerHTML, `[data-id="${elemUniqueId}"]`, idMap);
             newValue = cssUrlFixer(idMap, newValue);
-            if (newValue !== el.innerHTML)
+            if (newValue !== el.innerHTML) {
                 el.innerHTML = newValue;
+            }
         }
-    });
-    
+    };
+
+    processElement(fragment);
+
+    const childElements = fragment.querySelectorAll("*");
+    for (const element of childElements) {
+        processElement(element);
+    }
+
     // For a sprite we want to include the whole DOM of sprite element
-    elem.innerHTML = spriteIconId ? fragment.outerHTML : fragment.innerHTML;
+    elem.innerHTML = isSpriteIcon ? fragment.outerHTML : fragment.innerHTML;
 
     // This code block basically merges attributes of the original SVG
     // the SVG element where it is called from. For eg,
     //
     // Let's say the original SVG is this:
-    // 
+    //
     // a.svg = <svg viewBox='..' ...></svg>
-    // 
+    //
     // and it is used as with svg-loader as <svg data-src="./a.svg" width="32"></svg>
     // this will create a combined element  <svg data-src="./a.svg" width="32" viewBox='..' ...></svg>
-    // 
-    // For sprite icons, we don't need this as we are including the whole outerHTML. 
+    //
+    // For sprite icons, we don't need this as we are including the whole outerHTML.
     if (!isSpriteIcon) {
         for (let i = 0; i < fragment.attributes.length; i++) {
-            const {
-                name,
-                value
-            } = fragment.attributes[i];
-    
+            const { name, value } = fragment.attributes[i];
+
             // Don't override the attributes already defined, but override the ones that
             // were in the original element
             if (!elem.getAttribute(name) || elemAttributesSet.has(name)) {
@@ -181,230 +256,270 @@ const renderBody = (elem, options, body) => {
         }
     }
 
-    attributesSet[elemUniqueId] = elemAttributesSet;
-
+    attributesSet.set(elem, elemAttributesSet);
     elem.setAttribute("data-id", elemUniqueId);
 
-    const event = new CustomEvent('iconload', {
+    const event = new CustomEvent("iconload", {
         bubbles: true
     });
     elem.dispatchEvent(event);
 
-    if (elem.getAttribute('oniconload')) {
+    if (elem.getAttribute("oniconload")) {
         // Handling (and executing) event attribute for our event (oniconload)
         // isn't straightforward. Because a) the code is a raw string b) there's
         // no way to specify the context for execution. So, `this` in the attribute
-        // will point to `window` instead of the element itself. 
+        // will point to `window` instead of the element itself.
         //
         // Here we are recycling a rarely used GlobalEventHandler 'onauxclick'
         // and offloading the execution to the browser. This is a hack, but because
-        // the event doesn't bubble, it shouldn't affect anything else in the code. 
-        elem.setAttribute('onauxclick', elem.getAttribute('oniconload'));
-        
-        const event = new CustomEvent('auxclick', {
+        // the event doesn't bubble, it shouldn't affect anything else in the code.
+        elem.setAttribute("onauxclick", elem.getAttribute("oniconload"));
+
+        const auxEvent = new CustomEvent("auxclick", {
             bubbles: false,
             view: window
         });
-        elem.dispatchEvent(event);
+        elem.dispatchEvent(auxEvent);
 
-        elem.removeAttribute('onauxclick');
+        elem.removeAttribute("onauxclick");
     }
 };
 
-const requestsInProgress = {};
-const memoryCache = {};
+const dispatchError = (elem, error) => {
+    console.error(error);
+    const event = new CustomEvent("iconloaderror", {
+        bubbles: true,
+        detail: error.toString()
+    });
+    elem.dispatchEvent(event);
+
+    if (elem.getAttribute("oniconloaderror")) {
+        // the oniconloaderror inline function will have access to an `error` argument
+        const loadErrorFunction = Function("error", elem.getAttribute("oniconloaderror"));
+        loadErrorFunction(error);
+    }
+};
 
 const renderIcon = async (elem) => {
-    const url = new URL(elem.getAttribute("data-src"), globalThis.location);
+    if (!elem || !elem.getAttribute) {
+        return;
+    }
+
+    const dataSrc = elem.getAttribute("data-src");
+    if (!dataSrc) {
+        return;
+    }
+
+    let url;
+    try {
+        url = new URL(dataSrc, globalThis.location);
+    } catch (e) {
+        dispatchError(elem, e);
+        return;
+    }
+
     const src = url.toString().replace(url.hash, "");
-    const spriteIconId = url.hash.replace("#", "");
-    
+    const spriteIconId = url.hash ? url.hash.replace("#", "") : "";
+
     const cacheOpt = elem.getAttribute("data-cache");
+    const isCachingEnabled = cacheOpt !== "disabled";
+    const cacheTtlMs = parseCacheTtl(cacheOpt);
 
     const enableJs = elem.getAttribute("data-js") === "enabled";
     const disableUniqueIds = elem.getAttribute("data-unique-ids") === "disabled";
     const disableCssScoping = elem.getAttribute("data-css-scoping") === "disabled";
 
-    const lsCache = await isCacheAvailable(src);
-    const isCachingEnabled = cacheOpt !== "disabled";
+    const renderBodyCb = (body) =>
+        renderBody(elem, { enableJs, disableUniqueIds, disableCssScoping, spriteIconId }, body);
 
-    const renderBodyCb = renderBody.bind(self, elem, { enableJs, disableUniqueIds, disableCssScoping, spriteIconId });
+    const cachedMemory = memoryCache.get(src);
+    if (cachedMemory) {
+        renderBodyCb(cachedMemory);
+        return;
+    }
 
-    // Memory cache optimizes same icon requested multiple
-    // times on the page
-    if (memoryCache[src] || (isCachingEnabled && lsCache)) {
-        const cache = memoryCache[src] || lsCache;
-
-        renderBodyCb(cache);
-    } else {
-        // If the same icon is being requested to rendered
-        // avoid firing multiple XHRs
-        if (requestsInProgress[src]) {
-            setTimeout(() => renderIcon(elem), 20);
+    if (isCachingEnabled) {
+        const cachedStorage = await getCacheEntry(src);
+        if (cachedStorage) {
+            memoryCache.set(src, cachedStorage);
+            renderBodyCb(cachedStorage);
             return;
         }
+    }
 
-        requestsInProgress[src] = true;
-
-        fetch(src)
-            .then((response) => {
-                if (!response.ok) {
-                    throw Error(`Request for '${src}' returned ${response.status} (${response.statusText})`);
-                }
-                return response.text();
-            })
-            .then((body) => {
-                const bodyLower = body.toLowerCase().trim();
-
-                if (!(bodyLower.startsWith("<svg") || bodyLower.startsWith("<?xml") || bodyLower.startsWith("<!doctype") )) {
-                    throw Error(`Resource '${src}' returned an invalid SVG file`);
-                }
-
-                if (isCachingEnabled) {
-                    setCache(src, body, cacheOpt);
-                }
-
-                memoryCache[src] = body;
-
+    if (inflightRequests.has(src)) {
+        try {
+            const body = await inflightRequests.get(src);
+            if (body) {
                 renderBodyCb(body);
-            })
-            .catch((e) => {
-                console.error(e);
-                const event = new CustomEvent('iconloaderror', {
-                    bubbles: true,
-                    detail: e.toString(),
-                });
-                elem.dispatchEvent(event);
-                if(elem.getAttribute('oniconloaderror')){
-                    // the oniconloaderror inline function will have access to an `error` argument
-                    const loadErrorFunction = Function("error", elem.getAttribute('oniconloaderror'));
-                    loadErrorFunction(e);
-                }
-            })
-            .finally(() => {
-                delete requestsInProgress[src];
-            });
+            }
+        } catch (e) {
+            dispatchError(elem, e);
+        }
+        return;
+    }
+
+    // De-duplicate in-flight fetches for the same source.
+    const requestPromise = fetch(src)
+        .then((response) => {
+            if (!response.ok) {
+                throw Error(`Request for '${src}' returned ${response.status} (${response.statusText})`);
+            }
+            return response.text();
+        })
+        .then((body) => {
+            const bodyLower = body.toLowerCase().trim();
+
+            if (!(bodyLower.startsWith("<svg") || bodyLower.startsWith("<?xml") || bodyLower.startsWith("<!doctype"))) {
+                throw Error(`Resource '${src}' returned an invalid SVG file`);
+            }
+
+            if (isCachingEnabled) {
+                setCacheEntry(src, body, cacheTtlMs);
+            }
+
+            memoryCache.set(src, body);
+            return body;
+        });
+
+    inflightRequests.set(src, requestPromise);
+
+    try {
+        const body = await requestPromise;
+        renderBodyCb(body);
+    } catch (e) {
+        dispatchError(elem, e);
+    } finally {
+        inflightRequests.delete(src);
     }
 };
 
-let intObserver;
+let intersectionObserver;
 if (globalThis.IntersectionObserver) {
-    intObserver = new IntersectionObserver(
+    intersectionObserver = new IntersectionObserver(
         (entries) => {
             entries.forEach((entry) => {
                 if (entry.isIntersecting) {
                     renderIcon(entry.target);
-    
-                    // Unobserve as soon as soon the icon is rendered
-                    intObserver.unobserve(entry.target);
+                    intersectionObserver.unobserve(entry.target);
                 }
             });
-        }, {
-            // Keep high root margin because intersection observer 
+        },
+        {
+            // Keep high root margin because intersection observer
             // can be slow to react
             rootMargin: "1200px"
         }
     );
 }
 
+const queueSvgElement = (element) => {
+    if (!element || element.getAttribute("data-id")) {
+        return;
+    }
 
-const handled = [];
-function renderAllSVGs() {
-    Array.from(document.querySelectorAll("svg[data-src]:not([data-id])"))
-        .forEach((element) => {
-            if (handled.indexOf(element) !== -1) {
-                return;
-            }
+    if (element.getAttribute("data-loading") === "lazy" && intersectionObserver) {
+        if (!observedElements.has(element)) {
+            observedElements.add(element);
+            intersectionObserver.observe(element);
+        }
+        return;
+    }
 
-            handled.push(element);
-            if (element.getAttribute("data-loading") === "lazy") {
-                intObserver.observe(element);
-            } else {
-                renderIcon(element);
-            }
-        });
+    renderIcon(element);
+};
+
+const collectSvgElements = (node) => {
+    const elements = [];
+
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) {
+        return elements;
+    }
+
+    if (node.matches && node.matches(UNRENDERED_SELECTOR)) {
+        elements.push(node);
+    }
+
+    if (node.querySelectorAll) {
+        node.querySelectorAll(UNRENDERED_SELECTOR).forEach((element) => elements.push(element));
+    }
+
+    return elements;
+};
+
+function renderAllSVGs(root = document) {
+    if (!root || !root.querySelectorAll) {
+        return;
+    }
+
+    root.querySelectorAll(UNRENDERED_SELECTOR).forEach(queueSvgElement);
 }
 
 let observerAdded = false;
 const addObservers = () => {
-    if (observerAdded) {
+    if (observerAdded || !globalThis.MutationObserver) {
         return;
     }
 
     observerAdded = true;
+
     const observer = new MutationObserver((mutationRecords) => {
-        const shouldTriggerRender = mutationRecords.some(
-            (record) => Array.from(record.addedNodes).some(
-                (elem) => elem.nodeType === Node.ELEMENT_NODE
-                    && ((elem.getAttribute("data-src") && !elem.getAttribute("data-id")) // Check if the element needs to be rendered
-                        || elem.querySelector("svg[data-src]:not([data-id])")) // Check if any of the element's children need to be rendered
-            )
-        );
-
-        // If any node is added, render all new nodes because the nodes that have already
-        // been rendered won't be rendered again.
-        if (shouldTriggerRender) {
-            renderAllSVGs();
-        }
-
-        // If data-src is changed, re-render
         mutationRecords.forEach((record) => {
-            if (record.type === "attributes") {
-                renderIcon(record.target);
+            if (record.type === "childList") {
+                record.addedNodes.forEach((node) => {
+                    collectSvgElements(node).forEach(queueSvgElement);
+                });
+            }
+
+            if (record.type === "attributes" && record.target) {
+                const target = record.target;
+                if (target.matches && target.matches(SVG_SELECTOR)) {
+                    renderIcon(target);
+                }
             }
         });
     });
 
-    observer.observe(
-        document.documentElement,
-        {
-            attributeFilter: ["data-src"],
-            attributes: true,
-            childList: true,
-            subtree: true
-        }
-    );
+    observer.observe(document.documentElement, {
+        attributeFilter: ["data-src"],
+        attributes: true,
+        childList: true,
+        subtree: true
+    });
 };
 
-if (globalThis.addEventListener) {
-    // Start rendering SVGs as soon as possible
-    const intervalCheck = setInterval(() => {
-        renderAllSVGs();
-    }, 100);
-
-    function init() {
-        clearInterval(intervalCheck);
-    
+if (globalThis.addEventListener && typeof document !== "undefined") {
+    const init = () => {
         renderAllSVGs();
         addObservers();
-    }
+    };
 
-    if (document.readyState === 'interactive') {
-        init();
+    if (document.readyState === "loading") {
+        globalThis.addEventListener("DOMContentLoaded", init, { once: true });
     } else {
-        globalThis.addEventListener("DOMContentLoaded", () => {
-            init();
-        });
+        init();
     }
 }
 
-globalThis.SVGLoader = {}
+globalThis.SVGLoader = globalThis.SVGLoader || {};
 globalThis.SVGLoader.destroyCache = async () => {
     // Handle error, "mutation operation was attempted on a database"
     // with try-catch
     try {
         const entriesCache = await entries();
-        
+
         for (const entry of entriesCache) {
-            if (entry[0].startsWith('loader_')) {
+            if (entry[0].startsWith(CACHE_PREFIX)) {
                 await del(entry[0]);
             }
         }
-    } catch(e) {}
+    } catch (e) {}
 
-    Object.keys(localStorage).forEach((key) => {
-        if (key.startsWith('loader_')) {
-            localStorage.removeItem(key);
-        }
-    });
-}
+    try {
+        Object.keys(localStorage).forEach((key) => {
+            if (key.startsWith(CACHE_PREFIX)) {
+                localStorage.removeItem(key);
+            }
+        });
+    } catch (e) {}
+};

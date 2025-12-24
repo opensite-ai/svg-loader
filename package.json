@@ -1,5 +1,5 @@
 {
-    "name": "external-svg-loader",
+    "name": "@page-speed/svg-loader",
     "license": "MIT",
     "description": "Plug 'n play external SVG loader",
     "homepage": "https://github.com/shubhamjain/svg-loader",
@@ -9,7 +9,19 @@
         "url": "https://github.com/shubhamjain/svg-loader.git"
     },
     "main": "dist/svg-loader.min.js",
-    "version": "1.7.1",
+    "version": "1.7.3",
+    "publishConfig": {
+        "access": "public"
+    },
+    "files": [
+        "dist",
+        "svg-loader.min.js",
+        "svg-loader.js",
+        "svg-loader.d.ts",
+        "lib",
+        "README.md",
+        "LICENSE"
+    ],
     "scripts": {
         "build:js": "cross-env NODE_ENV=production webpack build",
         "build:cp": "npx cpr ./dist/svg-loader.min.js ./svg-loader.min.js --overwrite",
@@ -20,7 +32,7 @@
         "prepare": "husky install"
     },
     "devDependencies": {
-        "cpr":"^3.0.1",
+        "cpr": "^3.0.1",
         "cross-env": "^7.0.3",
         "http-server": "^14.0.0",
         "husky": "^8.0.3",
@@ -29,6 +41,6 @@
         "webpack-cli": "^4.9.2"
     },
     "dependencies": {
-        "idb-keyval": "^6.2.0"
+        "idb-keyval": "^6.2.2"
     }
 }
